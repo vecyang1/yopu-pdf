@@ -272,3 +272,64 @@ class TestDecodeZPath(unittest.TestCase):
 
     def test_non_endpoint_returns_none(self):
         self.assertIsNone(net.decode_z_path("!!!not-valid"))
+
+
+class TestEgressChainAndImpersonateLanes(unittest.TestCase):
+    """The multi-lane fallback chain and the curl_cffi lanes (vps/proxy/imp).
+    The relay/tunnel side effects are exercised e2e, not here; these pin the
+    pure parsing + wiring that a rename would silently break."""
+
+    def test_new_lane_kinds_parse(self):
+        self.assertEqual(net.parse_egress("vps:my-host"), ("vps", "my-host"))
+        self.assertEqual(net.parse_egress("proxy:vn"), ("residential", "vn"))
+        self.assertEqual(net.parse_egress("imp:socks5://127.0.0.1:9"),
+                         ("impersonate", "socks5://127.0.0.1:9"))
+
+    def test_split_lanes_drops_blanks(self):
+        self.assertEqual(net._split_lanes("a, b ,,c "), ["a", "b", "c"])
+        self.assertEqual(net._split_lanes("  "), [])
+
+    def test_chain_from_cli_overrides_and_splits(self):
+        self.assertEqual(net.resolve_egress_chain("vps:a,proxy:vn"),
+                         ["vps:a", "proxy:vn"])
+
+    def test_chain_env_when_no_cli(self):
+        with mock.patch.dict(os.environ, {"YOPU_PDF_EGRESS": "vps:x , proxy:us"}):
+            self.assertEqual(net.resolve_egress_chain(None), ["vps:x", "proxy:us"])
+
+    def test_resolve_residential_uses_the_resolver_stdout(self):
+        # A fake resolver command whose stdout is the URL; no network, no creds.
+        got = net.resolve_residential(
+            "vn", resolver="printf http://u:p@gw:823 #")
+        self.assertEqual(got, "http://u:p@gw:823")
+
+    def test_resolve_residential_empty_output_raises_unavailable(self):
+        with self.assertRaises(net.EgressUnavailable):
+            net.resolve_residential("vn", resolver="true")  # prints nothing
+
+    def test_impersonate_relay_uses_session_and_forwards_minimal_headers(self):
+        class FakeResp:
+            status_code = 200
+            headers = {"Content-Type": "application/octet-stream",
+                       "Content-Encoding": "gzip", "Set-Cookie": "c=1"}
+            content = b"SHEET"
+        seen = {}
+
+        class FakeSession:
+            def request(self, method, url, headers=None, data=None, proxies=None, timeout=None):
+                seen.update(method=method, url=url, headers=headers, proxies=proxies)
+                return FakeResp()
+
+        relay = net.make_impersonate_relay("socks5h://127.0.0.1:7", session=FakeSession())
+        status, hdrs, body = relay(
+            "https://yopu.co/z/abc", "GET",
+            {"User-Agent": "real-chrome", "Cookie": "c=browser",
+             "Referer": "https://yopu.co/view/x", "Accept": "*/*"}, None)
+        self.assertEqual((status, body), (200, b"SHEET"))
+        # impersonate sets UA; the browser's UA and Cookie must NOT be forwarded.
+        self.assertNotIn("User-Agent", seen["headers"])
+        self.assertNotIn("Cookie", seen["headers"])
+        self.assertIn("Referer", seen["headers"])
+        # transport headers stripped so a decompressed body is consistent.
+        self.assertNotIn("Content-Encoding", hdrs)
+        self.assertEqual(seen["proxies"]["https"], "socks5h://127.0.0.1:7")
