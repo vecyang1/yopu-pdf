@@ -46,9 +46,18 @@ def safe_b64decode(data: bytes) -> bytes:
 import json
 import os
 import shlex
+import socket
 import subprocess
+import threading
+import time
 from pathlib import Path
 from urllib.parse import quote, urlparse
+
+
+class EgressUnavailable(Exception):
+    """An egress lane cannot be set up (missing dep, unresolved proxy). The caller
+    treats it like a lane that failed and moves to the next one in the chain."""
+
 
 # The banned host and its same-origin sibling. cdn.yopu.co is deliberately NOT
 # here: it is a separate, un-banned CDN and must stay direct (proxying ~1MB of
@@ -119,6 +128,40 @@ def resolve_egress(cli_value: str | None) -> str | None:
     return None
 
 
+def _split_lanes(spec: str) -> list[str]:
+    """A spec string -> ordered lane list. Commas separate lanes, so one line can
+    say ``ssh:vps,proxy:vn``. Empty pieces are dropped."""
+    return [p.strip() for p in spec.split(",") if p.strip()]
+
+
+def _read_config_lanes() -> list[str]:
+    """Every non-comment, non-blank line of the config, each split on commas, in
+    file order -- the ordered fallback chain."""
+    try:
+        text = config_path().read_text(encoding="utf-8")
+    except OSError:
+        return []
+    lanes: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            lanes.extend(_split_lanes(line))
+    return lanes
+
+
+def resolve_egress_chain(cli_value: str | None) -> list[str]:
+    """The ordered fallback chain of egress lanes tried AFTER a direct attempt,
+    by precedence: CLI flag, ``YOPU_PDF_EGRESS`` env, then the config file. The
+    first source that yields any lane wins (they do not stack), so ``--egress``
+    fully overrides the config. Each source may list several lanes (comma-
+    separated, or one per config line): ``ssh:my-vps,proxy:vn`` means try the VPS
+    first, then the residential lane."""
+    for src in (cli_value, os.environ.get("YOPU_PDF_EGRESS")):
+        if src and src.strip():
+            return _split_lanes(src)
+    return _read_config_lanes()
+
+
 def parse_egress(spec: str) -> tuple[str, str]:
     """Classify an egress spec into ``(kind, value)``.
 
@@ -143,8 +186,21 @@ def parse_egress(spec: str) -> tuple[str, str]:
     """
     s = spec.strip()
     low = s.lower()
+    if low.startswith("vps:"):
+        # vps:<host> -- curl_cffi (browser TLS) through an `ssh -D` tunnel that
+        # exits <host>'s IP. Free lane that fetches the sheet; the plain `ssh:`
+        # curl relay does NOT (its non-browser fingerprint gets 404).
+        return ("vps", s[len("vps:"):].strip())
     if low.startswith("ssh:"):
         return ("ssh", s[len("ssh:"):].strip())
+    if low.startswith("proxy:"):
+        # proxy:<geo> -- residential lane via curl_cffi impersonation; the ONLY
+        # egress that fetches the sheet. <geo> resolves creds through the local
+        # resolver so they never touch argv. Empty geo => resolver's default.
+        return ("residential", s[len("proxy:"):].strip())
+    if low.startswith("imp:"):
+        # imp:<proxy-url> -- same relay, but a literal proxy URL you pass yourself.
+        return ("impersonate", s[len("imp:"):].strip())
     if low.startswith("worker "):
         return ("worker", s[len("worker "):].strip())
     if low.startswith("worker:"):
@@ -313,6 +369,104 @@ def _ssh_exec(ctl: str, host: str, remote_cmd: str, stdin: bytes | None, timeout
         raise RuntimeError(f"ssh relay to {host} failed: "
                            f"{proc.stderr.decode('utf-8', 'replace')[:160]}")
     return proc.stdout
+
+
+# curl_cffi impersonate relay -- the only relay that fetches yopu.co's sheet ---
+# Headers to forward from the browser's own request. NOT user-agent (impersonate
+# sets the whole browser header order/casing that the JA3/JA4 check keys on) and
+# NOT cookie (the curl_cffi Session carries its own jar across doc -> /z).
+_IMP_REQ_ALLOW = frozenset({"referer", "accept", "accept-language", "content-type"})
+
+
+def resolve_residential(geo: str | None = None, *, resolver=None) -> str:
+    """Return a residential proxy URL (with creds) from the local resolver, so the
+    credential never has to pass through argv. Default resolver is the
+    ultra-low-cost-scraper skill's ``proxy_resolver.py``; override with
+    ``$YOPU_PDF_PROXY_RESOLVER`` (a command; ``--geo <cc> --format url`` is appended)."""
+    cmd = (resolver or os.environ.get("YOPU_PDF_PROXY_RESOLVER")
+           or f"python3 {os.path.expanduser('~')}/.agents/skills/ultra-low-cost-scraper/scripts/proxy_resolver.py")
+    args = shlex.split(cmd) + ["--format", "url"] + (["--geo", geo] if geo else [])
+    out = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    url = (out.stdout or "").strip()
+    if not url:
+        raise EgressUnavailable(
+            "could not resolve a residential proxy URL. Set $YOPU_PDF_PROXY_RESOLVER "
+            "to a command that prints 'http://user:pass@host:port', or configure the "
+            f"ultra-low-cost-scraper skill.\n  resolver said: {(out.stderr or '').strip()[:160]}")
+    return url
+
+
+def make_impersonate_relay(proxy_url: str | None, *, impersonate: str = "chrome",
+                           timeout: int = 40, session=None):
+    """Return ``relay(url, method, headers, post_data) -> (status, headers, body)``
+    that fetches one same-origin request with ``curl_cffi`` using a real browser
+    TLS/JA3 fingerprint, through ``proxy_url``.
+
+    This is the ONLY relay that fetches yopu.co's sheet. Measured 2026-09-04: the
+    ``/api/sheet`` (``/z``) call is refused (empty 404) for any non-browser TLS
+    fingerprint -- plain ``curl``, and therefore the ``ssh:``/``worker`` relays,
+    all 404 even from a healthy home IP. ``curl_cffi``'s ``impersonate`` passes the
+    check; paired with a residential ``proxy_url`` (the un-flagged IP the sheet API
+    also requires) it returns 200. A single kept-alive Session pins one exit IP
+    across the doc and ``/z`` calls, so the session cookie holds even on a
+    rotating proxy port, and the Session's own jar carries that cookie -- the
+    browser's Cookie header is neither needed nor forwarded."""
+    try:
+        from curl_cffi import requests as _cffi  # optional dep; only this relay needs it
+    except ImportError as e:
+        raise EgressUnavailable(
+            "the residential/impersonate egress needs curl_cffi. Install it:\n"
+            "    ./.venv/bin/pip install curl_cffi") from e
+    sess = session if session is not None else _cffi.Session(impersonate=impersonate)
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    lock = threading.Lock()  # one Session, serialize the ~3 concurrent app-host calls
+    from curl_cffi import CurlError  # transient handshake failures on rotating exits
+
+    def relay(url: str, method: str, headers: dict, post_data):
+        fwd = {k: v for k, v in headers.items() if k.lower() in _IMP_REQ_ALLOW}
+        last = None
+        for attempt in range(3):  # a residential exit can die mid-handshake; retry
+            try:
+                with lock:  # curl_cffi Session is not safe for concurrent requests
+                    r = sess.request(method, url, headers=fwd, data=post_data,
+                                     proxies=proxies, timeout=timeout)
+                return r.status_code, filter_response_headers(dict(r.headers)), r.content
+            except CurlError as e:
+                last = e
+                time.sleep(0.6 * (attempt + 1))
+        raise last
+
+    return relay
+
+
+def open_ssh_socks(host: str, *, timeout: int = 15):
+    """Open ``ssh -D <port> -N <host>`` -- a local SOCKS5 proxy whose traffic exits
+    *host*'s IP -- and return ``(socks_url, proc)``. The caller must
+    ``proc.terminate()`` when done. Pairs with ``make_impersonate_relay`` to give
+    a free VPS lane: curl_cffi's browser TLS fingerprint (which the sheet API
+    requires) exiting a host you already rent, at zero marginal cost."""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    proc = subprocess.Popen(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+         "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15",
+         "-N", "-D", f"127.0.0.1:{port}", host],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            err = proc.stderr.read().decode("utf-8", "replace")[:160] if proc.stderr else ""
+            raise EgressUnavailable(f"ssh -D to {host} exited: {err}")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                return f"socks5h://127.0.0.1:{port}", proc
+        except OSError:
+            time.sleep(0.3)
+    proc.terminate()
+    raise EgressUnavailable(f"ssh -D to {host} did not come up within {timeout}s")
 
 
 # --- /z path de-obfuscation -------------------------------------------------

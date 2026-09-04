@@ -75,44 +75,51 @@ atomic, so every page wastes part of a line.) Trailing blank pages are removed.
 yopu.co rate-limits by IP. Once tripped, `/view/<id>` returns a **bare `404` with an
 empty body** — even though the sheet is public and loads fine elsewhere. So a `404`
 here means *"your IP is blocked"*, not *"no such sheet"*. The `/view` shell recovers
-on its own within ~tens of minutes to a few hours; a full render worked again the
-next morning without any intervention.
+on its own within ~tens of minutes to a few hours.
 
-**The tool fails fast with that diagnosis** instead of hanging, so you know to wait
-or switch networks rather than debug the tool.
+**The tool fails fast with that diagnosis** instead of hanging, and it can route
+around the block with an automatic **fallback chain**.
 
-### Why a proxy does not fix it (measured 2026-09-03/04)
+### The one thing the sheet API actually checks: a browser TLS fingerprint
 
-The sheet itself comes from `/api/sheet` (hidden behind `/z/<obfuscated>`). That call
-needs **two things at once**, and every workaround fails one of them:
+The sheet comes from `/api/sheet` (behind `/z/<obfuscated>`). Measured 2026-09-04:
+that call requires a **real-browser TLS/JA3 fingerprint**. A plain-`curl` client
+gets an empty `404` *even from a healthy home IP that renders fine in a browser* —
+so the naive `ssh:<host>` curl relay and the CF Worker cannot fetch the sheet. The
+**exit IP does not matter**: [`curl_cffi`](https://github.com/lexiforest/curl_cffi)
+with `impersonate="chrome"` returns `200` from a home IP, a datacenter VPS, **and**
+a residential proxy alike. (Direct mode already works because it drives a real
+Chrome via Playwright.)
 
-1. **A real browser client fingerprint.** Plain `curl` gets `404` on `/z` *even from
-   a healthy home IP that renders fine in the browser* — yopu.co checks the TLS/client
-   fingerprint. So any `curl`-based relay (an `ssh:<host>` relay, the CF Worker) cannot
-   fetch the sheet, on any IP.
-2. **A clean, un-flagged IP.** A real browser routed through a proxy also gets `404` on
-   `/z` — tested across 13 exits: 11 datacenter/VPN, **and two genuine residential**
-   exits from a shared residential-proxy pool. yopu.co risk-scores
-   and blocks known proxy ranges on the sheet API (its page loads Alibaba anti-fraud +
-   reCAPTCHA).
+So when your home IP is rate-limited, route the small handful of app-host requests
+(the doc + two `/z` calls) through a lane that carries a browser fingerprint. The
+heavy `cdn.yopu.co` assets always load direct.
 
-Only **a real browser from your own un-flagged connection** satisfies both — which is
-exactly how this tool renders (Playwright Chrome, direct). So:
+### Egress lanes and the fallback chain
 
-- **If your IP is blocked, the fix is a clean connection, not a proxy:** run it from a
-  different network, or a **phone hotspot** (a fresh mobile IP). Or just wait for your
-  home IP's block to clear.
-- **A commercial VPN / residential-proxy pool will not work** for the sheet — the whole
-  pool is flagged.
+Configure a chain in `~/.config/yopu-pdf/egress` (one lane per line, or comma-
+separated; tried **in order after a direct attempt**). Override per-run with
+`--egress "A,B"`, or force direct with `--no-egress`.
 
-### The `--egress` fallback (exists, but cannot beat the sheet gate)
+```text
+vps:my-vps      # curl_cffi through an `ssh -D` tunnel exiting a host you rent  (free)
+proxy:vn        # curl_cffi through a residential pool, geo vn  (~$1/GB backstop)
+```
 
-The tool still supports `--egress "<spec>"` (alias `--proxy`; `--no-egress` forces
-direct), and a one-line `~/.config/yopu-pdf/egress` for a default. It is **direct-first
-with auto-fallback**, and the mechanism is correct — but for yopu.co's sheet it cannot
-help (per the two requirements above). It remains useful only for un-authenticated
-reads. `proxy-worker/` is a small, locked Cloudflare Worker relay kept for those; its
-key stays out of git.
+- **`vps:<host>`** — opens `ssh -D` to a host you can `ssh` to and sends the
+  app-host requests through it with a browser fingerprint. Free, and it fetches the
+  sheet. (This is the lane the old plain `ssh:` relay *should* have been.)
+- **`proxy:<geo>`** — curl_cffi through a residential proxy pool. Credentials are
+  resolved by an external command so they never touch argv: set
+  `$YOPU_PDF_PROXY_RESOLVER` to a command that prints `http://user:pass@host:port`
+  (given `--geo <cc> --format url`).
+- **`imp:<proxy-url>`** — curl_cffi through any SOCKS/HTTP proxy URL you supply.
+- `ssh:<host>` (plain curl) and `worker <url>` remain for non-sheet reads; they do
+  **not** fetch the sheet (no browser fingerprint).
+
+A single kept-alive session pins one exit IP across the doc and `/z` calls, so the
+session cookie holds even on a rotating proxy port. `curl_cffi` is an optional
+dependency (only the `vps:`/`proxy:`/`imp:` lanes use it): `pip install curl_cffi`.
 
 
 ## Notes
@@ -132,7 +139,7 @@ key stays out of git.
 ./.venv/bin/python -m unittest discover -p "test_*.py"
 ```
 
-Hermetic — no network, no browser. 60 tests across `test_yopu_pdf.py`
+Hermetic — no network, no browser. 67 tests across `test_yopu_pdf.py`
 (PDF/pagination/routing) and `test_net.py` (egress), all pinning failures that
 are *silent* rather than loud:
 

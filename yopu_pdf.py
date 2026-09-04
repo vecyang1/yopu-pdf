@@ -69,16 +69,15 @@ class SheetNotRendered(Exception):
     """The page (/view) loaded 200 but the sheet data call (/z -> /api/sheet)
     returned 404, so nothing rendered.
 
-    Measured 2026-09-03: yopu.co serves the public /view shell from anywhere, but
-    its sheet API is refused (empty 404) from every PROXY IP class tested -- 11
-    datacenter/VPN exits (Surfshark WireGuard, vless, three VPSes) AND two genuine
-    residential exits from a shared residential-proxy pool,
-    each /view=200 /z=404 from first contact. So NO egress this tool can drive
-    (ssh:<vps>, a Worker, a browser proxy -- datacenter or residential-pool) fetches
-    the sheet: yopu.co appears to block known proxy ranges on /api/sheet. The only
-    vantage ever observed to return /z=200 is the user's own un-flagged connection.
-    (Unverified whether yopu also changed the endpoint server-side; no clean IP was
-    available to test.)"""
+    Root cause (measured 2026-09-04): /api/sheet requires a REAL BROWSER TLS/JA3
+    fingerprint. A plain-curl client -- and therefore the ``ssh:`` curl relay and
+    the CF ``worker`` -- gets an empty 404 *from any IP, including a healthy home
+    one*. The exit IP itself does NOT matter: curl_cffi with ``impersonate=chrome``
+    returns 200 from a home IP, a datacenter VPS, and a residential proxy alike.
+    So the fix is a lane that carries a browser fingerprint: ``vps:<host>`` (free)
+    or ``proxy:<geo>`` (residential). Hitting THIS error means the current lane had
+    no browser fingerprint (plain ``ssh:``/``worker``) or the home IP is
+    volume-banned with no such lane configured."""
 
     def __init__(self, url: str, egress_kind: str | None):
         self.url = url
@@ -86,11 +85,11 @@ class SheetNotRendered(Exception):
         via = f" via the '{egress_kind}' egress" if egress_kind else ""
         super().__init__(
             f"loaded the /view page{via} but the sheet API (/api/sheet) returned an empty 404, so "
-            f"it never rendered. yopu.co refuses /api/sheet from proxy IPs of every class tested "
-            f"(datacenter, VPN, and shared residential-proxy pools). Run this from your own "
-            f"un-flagged connection -- your home network, or a phone hotspot for a fresh mobile IP -- "
-            f"or wait for your home IP's rate-limit block to clear (hours). A commercial VPN/proxy or "
-            f"the 'ssh:'/'worker' egress will NOT work for the sheet.")
+            f"it never rendered. /api/sheet needs a real-browser TLS fingerprint, which the plain "
+            f"'ssh:'/'worker' relays lack. Use a curl_cffi lane (works from any IP): a free "
+            f"'vps:<host>' (ssh -D tunnel) or 'proxy:<geo>' (residential) -- put one in "
+            f"{net.config_path()} or pass --egress. If you are already on a curl_cffi lane, its exit "
+            f"may be volume-banned; try another host/geo or wait for your home IP to clear.")
 
 VIEW_RE = re.compile(r"^[A-Za-z0-9_-]{5,32}$")
 PAGE_IMG_RE = re.compile(r"^\d+\.png$")
@@ -478,37 +477,46 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
-    # Egress policy:
-    #   --egress SPEC -> force that egress for every request (no direct attempt).
-    #   --no-egress   -> direct only, never fall back.
-    #   otherwise     -> try DIRECT first and, only when yopu.co blocks us, retry
-    #                    that sheet via the egress configured in env/config. This
-    #                    keeps the normal (un-banned) path fast and puts no load
-    #                    on the proxy/Worker until it is actually needed.
-    forced_spec = args.egress.strip() if (args.egress and args.egress.strip()) else None
-    fallback_spec = None
-    if not args.no_egress and not forced_spec:
-        fallback_spec = net.resolve_egress(None)  # env or config file, not the CLI flag
+    # Egress policy (multi-lane fallback: direct -> lane1 -> lane2 -> ...):
+    #   --no-egress   -> direct only.
+    #   --egress A,B  -> try lanes A then B, in order (no direct attempt).
+    #   otherwise     -> DIRECT first, then each configured lane (env/config) in
+    #                    order until one renders. Direct stays fast; a lane engages
+    #                    only when yopu.co blocks the one before it.
+    if args.no_egress:
+        lanes, try_direct = [], True
+    elif args.egress and args.egress.strip():
+        lanes, try_direct = net.resolve_egress_chain(args.egress), False
+        print(f"↪ egress forced: {', '.join(lanes)}", file=sys.stderr)
+    else:
+        lanes, try_direct = net.resolve_egress_chain(None), True
+
+    tunnels = {}  # host -> ssh -D Popen, opened lazily for vps: lanes, closed at exit
 
     def setup_egress(spec):
-        """spec -> (kind, browser_proxy_dict_or_None, relay_or_None)."""
+        """spec -> (kind, browser_proxy_dict_or_None, relay_or_None). May raise
+        net.EgressUnavailable, which the caller treats as a lane that failed."""
         kind, value = net.parse_egress(spec)
         if kind == "worker":
             return kind, None, net.make_worker_relay(value)
         if kind == "ssh":
             return kind, None, net.make_ssh_relay(value)
+        if kind == "vps":
+            surl = tunnels.get(value)
+            if surl is None or surl[1].poll() is not None:
+                surl = tunnels[value] = net.open_ssh_socks(value)
+            return kind, None, net.make_impersonate_relay(surl[0])
+        if kind == "residential":
+            return kind, None, net.make_impersonate_relay(net.resolve_residential(value or None))
+        if kind == "impersonate":
+            return kind, None, net.make_impersonate_relay(value)
         return kind, {"server": value}, None  # browser-proxy
-
-    primary_kind = primary_proxy = primary_relay = None
-    if forced_spec:
-        primary_kind, primary_proxy, primary_relay = setup_egress(forced_spec)
-        print(f"↪ egress forced: {primary_kind}", file=sys.stderr)
 
     failed = []
     used: set[Path] = set()
     with sync_playwright() as pw:
-        browser = launch(pw, args.headed, proxy=primary_proxy)
-        fb_browser = [None]  # a proxied browser, launched lazily only if a browser-proxy fallback fires
+        browser = launch(pw, args.headed, proxy=None)  # the direct browser
+        proxied = {}  # server-url -> lazily launched proxied browser (browser-proxy lanes)
 
         def render_once(br, relay, kind, target):
             page = br.new_page(
@@ -521,33 +529,43 @@ def main() -> int:
             finally:
                 page.close()
 
+        def render_with_fallback(url):
+            attempts = (["__direct__"] if try_direct else []) + list(lanes)
+            if not attempts:
+                attempts = ["__direct__"]
+            last = None
+            for i, spec in enumerate(attempts):
+                nxt = attempts[i + 1] if i + 1 < len(attempts) else None
+                try:
+                    if spec == "__direct__":
+                        return render_once(browser, None, None, url)
+                    kind, proxy_dict, relay = setup_egress(spec)
+                    if proxy_dict:  # browser-proxy lane needs its own proxied browser
+                        br = proxied.get(proxy_dict["server"])
+                        if br is None:
+                            br = proxied[proxy_dict["server"]] = launch(pw, args.headed, proxy=proxy_dict)
+                        return render_once(br, None, kind, url)
+                    return render_once(browser, relay, kind, url)
+                except net.EgressUnavailable as exc:
+                    last = exc
+                    print(f"  ↪ skip lane '{spec}': {exc}", file=sys.stderr)
+                    continue
+                except (EgressBlocked, SheetNotRendered) as exc:
+                    last = exc
+                    where = "direct" if spec == "__direct__" else f"'{spec}'"
+                    if nxt:
+                        print(f"  ↪ {where} blocked by yopu.co; trying '{nxt}'…", file=sys.stderr)
+                    continue
+            raise last if last is not None else RuntimeError("no egress lane available")
+
         try:
             for raw in args.urls:
                 url = normalize_url(raw)
                 try:
-                    out, pages, scale = render_once(browser, primary_relay, primary_kind, url)
-                except (EgressBlocked, SheetNotRendered) as exc:
-                    if not fallback_spec:
-                        failed.append(raw)
-                        print(f"✗ {url}\n  {exc}", file=sys.stderr)
-                        continue
-                    fk, fp, fr = setup_egress(fallback_spec)
-                    print(f"  ↪ direct blocked by yopu.co; retrying via the configured {fk} egress…",
-                          file=sys.stderr)
-                    try:
-                        if fp:  # a browser-proxy fallback needs its own proxied browser
-                            if fb_browser[0] is None:
-                                fb_browser[0] = launch(pw, args.headed, proxy=fp)
-                            out, pages, scale = render_once(fb_browser[0], None, fk, url)
-                        else:
-                            out, pages, scale = render_once(browser, fr, fk, url)
-                    except Exception as exc2:
-                        failed.append(raw)
-                        print(f"✗ {url}\n  {exc2}", file=sys.stderr)
-                        continue
+                    out, pages, scale = render_with_fallback(url)
                 except Exception as exc:
                     failed.append(raw)
-                    print(f"✗ {url}\n  {type(exc).__name__}: {exc}", file=sys.stderr)
+                    print(f"✗ {url}\n  {exc}", file=sys.stderr)
                     continue
 
                 note = "" if scale >= 0.999 else f", shrunk to {scale:.2f} to save a page"
@@ -571,8 +589,10 @@ def main() -> int:
                 print(f"    {out.name}  +  {shown}   @ {args.dpi} dpi")
         finally:
             browser.close()
-            if fb_browser[0] is not None:
-                fb_browser[0].close()
+            for br in proxied.values():
+                br.close()
+            for _url, proc in tunnels.values():
+                proc.terminate()
 
     if failed:
         print(f"\n{len(failed)} of {len(args.urls)} failed: {', '.join(failed)}", file=sys.stderr)
