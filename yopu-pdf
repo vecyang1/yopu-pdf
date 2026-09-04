@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Thin wrapper so the tool runs from anywhere without activating the venv.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$here/.venv/bin/python" "$here/yopu_pdf.py" "$@"
