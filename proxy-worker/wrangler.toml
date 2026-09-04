@@ -1,0 +1,6 @@
+name = "yopu-pdf-proxy"
+main = "worker.js"
+compatibility_date = "2026-08-01"
+workers_dev = true
+
+# PROXY_KEY is set as a secret (never committed):  wrangler secret put PROXY_KEY
