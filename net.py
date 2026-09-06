@@ -383,6 +383,15 @@ def resolve_residential(geo: str | None = None, *, resolver=None) -> str:
     credential never has to pass through argv. Default resolver is the
     ultra-low-cost-scraper skill's ``proxy_resolver.py``; override with
     ``$YOPU_PDF_PROXY_RESOLVER`` (a command; ``--geo <cc> --format url`` is appended)."""
+    if not resolver and not os.environ.get("YOPU_PDF_PROXY_RESOLVER"):
+        try:
+            from ulcs.proxy import resolve_proxy_url
+            url = resolve_proxy_url(geo=geo)
+            if url:
+                return url
+        except ImportError:
+            pass
+
     cmd = (resolver or os.environ.get("YOPU_PDF_PROXY_RESOLVER")
            or f"python3 {os.path.expanduser('~')}/.agents/skills/ultra-low-cost-scraper/scripts/proxy_resolver.py")
     args = shlex.split(cmd) + ["--format", "url"] + (["--geo", geo] if geo else [])
