@@ -436,7 +436,7 @@ def main() -> int:
         epilog="examples:\n"
                "  yopu-pdf https://yopu.co/view/aXYaaOXZ\n"
                "  yopu-pdf https://yopu.co/view/aXYaaOXZ --p   # + a folder of numbered PNGs\n"
-               "  yopu-pdf aXYaaOXZ rpQ4rdoP -d output\n"
+               "  yopu-pdf aXYaaOXZ rpQ4rdoP -d ./output\n"
                "  yopu-pdf aXYaaOXZ --no-fit        # never shrink to save a page",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

@@ -4,20 +4,20 @@ Dump a [yopu.co](https://yopu.co) (有谱么) sheet page to PDF — **selectable
 
 ```bash
 ./setup.sh                                  # once
-yp https://yopu.co/view/aXYaaOXZ            # alias: saves into downloads
+yp https://yopu.co/view/aXYaaOXZ            # alias: saves into ./downloads
 yp https://yopu.co/view/aXYaaOXZ --p        # + a folder of numbered page PNGs
 ./yopu-pdf https://yopu.co/view/aXYaaOXZ    # -> 再见青春 - 汪峰 吉他和弦谱.pdf
-./yopu-pdf aXYaaOXZ rpQ4rdoP -d output   # bare IDs work too; batch is fine
+./yopu-pdf aXYaaOXZ rpQ4rdoP -d ./output    # bare IDs work too; batch is fine
 ```
 
 The `yp` alias (zsh function + `noglob`, defined in `~/.zshrc`, documented in the
-`alias` skill) is the everyday entry point: `yp <url-or-id>` saves into `downloads`.
+`alias` skill) is the everyday entry point: `yp <url-or-id>` saves into downloads directory.
 
 ## `--p` — one sheet, one folder
 
 `--p` (also `-p` / `--images`) explodes the PDF into numbered PNGs — the same
 shape the existing `p` alias produces, so pages flip in reading order — and
-moves the PDF in with them. One sheet becomes **one item** in `downloads`, so
+moves the PDF in with them. One sheet becomes **one item** in `./downloads`, so
 it is a single thing to open, move, or throw away:
 
 ```text

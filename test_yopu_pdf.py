@@ -185,7 +185,7 @@ class TestCollectIntoFolder(unittest.TestCase):
                          {"1.png", "2.png", "3.png", pdf.name})
 
     def test_folder_is_the_only_thing_added_to_the_output_dir(self):
-        """The point of the change: one sheet is one item in downloads."""
+        """The point of the change: one sheet is one item in downloads folder."""
         pdf = self.make_pdf()
         with mock.patch("yopu_pdf.subprocess.run", self.fake_pdftoppm(2)):
             folder, _, _ = collect_into_folder(pdf, 200)
